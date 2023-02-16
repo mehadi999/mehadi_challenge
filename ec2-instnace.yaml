@@ -1,0 +1,93 @@
+- name: Deploy Hello World web application
+  hosts: all
+  become: true
+
+  vars:
+    region: "us-east-1"
+    instance_type: "t2.micro"
+    ami: "ami-0c55b159cbfafe1f0"
+    key_name: "my-ec2-key"
+    security_group: "hello-world-sg"
+    domain_name: "example.com"
+    certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/id-for-certificate"
+
+  tasks:
+    - name: Create Security Group
+      ec2_group:
+        name: "{{ security_group }}"
+        description: "Hello World Security Group"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+
+    - name: Provision EC2 instance
+      ec2:
+        region: "{{ region }}"
+        instance_type: "{{ instance_type }}"
+        image: "{{ ami }}"
+        key_name: "{{ key_name }}"
+        group: "{{ security_group }}"
+        count: 1
+        wait: yes
+        instance_tags:
+          Name: "HelloWorldApp"
+      register: ec2_instance
+
+    - name: Add EC2 instance to host group
+      add_host:
+        name: "{{ item.public_ip }}"
+        groups: ec2_hosts
+      with_items: "{{ ec2_instance.instances }}"
+
+    - name: Install Nginx web server
+      apt:
+        name: nginx
+        state: present
+
+    - name: Copy index.html file to web server
+      copy:
+        src: index.html
+        dest: /usr/share/nginx/html/index.html
+      notify: restart nginx
+
+    - name: Configure Nginx to redirect HTTP to HTTPS
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        line: |
+          server {
+            listen 80;
+            server_name _;
+            return 301 https://$host$request_uri;
+          }
+      notify: restart nginx
+
+    - name: Install self-signed SSL certificate
+      shell: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx-selfsigned.key \
+        -out /etc/ssl/certs/nginx-selfsigned.crt \
+        -subj "/C=US/ST=CA/L=San Francisco/O=MyOrg/OU=IT/CN=example.com"
+
+    - name: Create CloudFront distribution
+      cloudfront_distribution:
+        origin_path: /usr/share/nginx/html/
+        origin_server: "{{ hostvars[groups['ec2_hosts'][0]]['ansible_host'] }}"
+        distribution_name: "HelloWorldCDN"
+        aliases:
+          - "{{ domain_name }}"
+        default_root_object: index.html
+        comment: "Hello World CloudFront distribution"
+        price_class: "PriceClass_All"
+        certificate: "{{ certificate_arn }}"
+      register: cloudfront
